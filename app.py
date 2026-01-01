@@ -490,7 +490,7 @@ with tab1:
     )
 
     st.divider()
-        st.divider()
+    st.divider()
     st.subheader("🧭 Upcoming catalysts across Top N")
     st.caption("Scan next earnings dates + count of recent news items so you can spot catalyst-heavy names quickly.")
 
