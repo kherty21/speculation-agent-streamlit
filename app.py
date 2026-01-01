@@ -577,23 +577,22 @@ with tab1:
         view_tbl = tbl.copy()
 
         # Apply earnings window filter (only when checkbox enabled)
-        if only_earnings_window:
-            # keep rows with 0 <= dte <= earnings_window_days
-            if "Days to earnings" in view_tbl.columns:
-    
-                # Only filter rows that actually HAVE an earnings date
-mask_has = view_tbl["Days to earnings"].notna()
-mask_in = (view_tbl["Days to earnings"] >= 0) & (view_tbl["Days to earnings"] <= earnings_window_days)
-view_tbl = view_tbl[~mask_has | (mask_has & mask_in)]
+    if only_earnings_window:
+        # keep rows with 0 <= dte <= earnings_window_days
+    if "Days to earnings" in view_tbl.columns:
+        # Only filter rows that actually HAVE an earnings date
+        mask_has = view_tbl["Days to earnings"].notna()
+        mask_in = (view_tbl["Days to earnings"] >= 0) & (view_tbl["Days to earnings"] <= earnings_window_days)
+        view_tbl = view_tbl[~mask_has | (mask_has & mask_in)]
 
         # Apply sort live even after scan (lets user change dropdown without re-scan)
-        if not view_tbl.empty:
-            if sort_by == "Earnings soonest":
-                view_tbl = view_tbl.sort_values(["Days to earnings", "Catalyst Score", "Spec Score"], ascending=[True, False, False], na_position="last")
+    if not view_tbl.empty:
+    if sort_by == "Earnings soonest":
+        view_tbl = view_tbl.sort_values(["Days to earnings", "Catalyst Score", "Spec Score"], ascending=[True, False, False], na_position="last")
             elif sort_by == "Catalyst score":
-                view_tbl = view_tbl.sort_values(["Catalyst Score", "Days to earnings", "Spec Score"], ascending=[False, True, False], na_position="last")
+        view_tbl = view_tbl.sort_values(["Catalyst Score", "Days to earnings", "Spec Score"], ascending=[False, True, False], na_position="last")
             else:
-                view_tbl = view_tbl.sort_values(["Spec Score", "Catalyst Score", "Days to earnings"], ascending=[False, False, True], na_position="last")
+        view_tbl = view_tbl.sort_values(["Spec Score", "Catalyst Score", "Days to earnings"], ascending=[False, False, True], na_position="last")
 
         st.dataframe(view_tbl, use_container_width=True, height=320)
 
