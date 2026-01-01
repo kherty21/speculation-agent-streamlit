@@ -1,4 +1,4 @@
-# Speculation Stock Agent (Streamlit Prototype + LLM Thesis)
+# Stock Agent
 
 This Streamlit app:
 - Scans a list of tickers
