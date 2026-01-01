@@ -12,7 +12,10 @@ import yfinance as yf
 import streamlit as st
 import requests
 
-from universe import filter_universe_us_stocks
+from universe import (
+    filter_universe_us_stocks,
+    build_dynamic_universe_daily,
+)
 
 # Optional: LLM-assisted thesis generation (OpenAI)
 try:
@@ -106,21 +109,17 @@ def days_until(date_iso: Optional[str]) -> Optional[int]:
         return None
 
 # =========================
-# Finnhub utilities
+# Finnhub (earnings + news)
 # =========================
 def _get_finnhub_key() -> Optional[str]:
     try:
         k = st.secrets.get("FINNHUB_API_KEY", None)
     except Exception:
         k = None
-    return k or os.getenv("FINNHUB_API_KEY")
+    return (k or os.getenv("FINNHUB_API_KEY") or "").strip() or None
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def finnhub_earnings_calendar_bulk(from_iso: str, to_iso: str, cache_day: str) -> pd.DataFrame:
-    """
-    One bulk call to Finnhub earnings calendar.
-    cache_day is a dummy parameter (e.g., today's date) to force daily cache refresh.
-    """
     token = _get_finnhub_key()
     if not token:
         return pd.DataFrame()
@@ -144,15 +143,10 @@ def finnhub_earnings_calendar_bulk(from_iso: str, to_iso: str, cache_day: str) -
         return pd.DataFrame()
 
 def build_next_earnings_map(df_calendar: pd.DataFrame) -> Dict[str, str]:
-    """
-    Builds {SYMBOL: next_earnings_iso} from a bulk earnings calendar DataFrame.
-    Picks earliest earnings date >= today per symbol.
-    """
     if df_calendar is None or df_calendar.empty:
         return {}
 
     today = dt.date.today()
-
     tmp = df_calendar.copy()
     tmp["date_parsed"] = pd.to_datetime(tmp["date"], errors="coerce").dt.date
     tmp = tmp.dropna(subset=["date_parsed", "symbol"])
@@ -173,9 +167,6 @@ def build_next_earnings_map(df_calendar: pd.DataFrame) -> Dict[str, str]:
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def finnhub_company_news_daily(ticker: str, limit: int, cache_day: str) -> List[dict]:
-    """
-    Company news via Finnhub, cached per ticker per day.
-    """
     token = _get_finnhub_key()
     if not token:
         return []
@@ -218,9 +209,6 @@ def finnhub_company_news_daily(ticker: str, limit: int, cache_day: str) -> List[
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_next_earnings_date(ticker: str) -> Optional[str]:
-    """
-    Uses the bulk earnings calendar (cached daily) and returns next earnings date for ticker.
-    """
     today = dt.date.today()
     to_day = today + dt.timedelta(days=180)
     cache_day = today.isoformat()
@@ -235,11 +223,6 @@ def fetch_news(ticker: str, limit: int = 10) -> List[dict]:
     return finnhub_company_news_daily(ticker, limit=int(limit), cache_day=cache_day)
 
 def catalyst_score(next_earnings_iso: Optional[str], news_items: List[dict], news_recency_hours: int = 72) -> float:
-    """
-    Simple heuristic catalyst score (0-100):
-    - Earnings within 0-21 days contributes up to 60 points
-    - Recent news within recency window contributes up to 40 points
-    """
     score = 0.0
     dte = days_until(next_earnings_iso)
 
@@ -415,9 +398,10 @@ def get_openai_client() -> Optional["OpenAI"]:
         key = st.secrets.get("OPENAI_API_KEY", None)
     except Exception:
         key = None
-    key = key or os.getenv("OPENAI_API_KEY")
+    key = (key or os.getenv("OPENAI_API_KEY") or "").strip()
     if not key:
         return None
+
     return OpenAI(api_key=key)
 
 def summarize_metrics_for_llm(ticker: str, row: pd.Series) -> str:
@@ -502,6 +486,7 @@ def compute_performance(journal: pd.DataFrame) -> pd.DataFrame:
         return journal
 
     j = journal.copy()
+
     for c in ["date", "ticker", "buy_price", "allocation_$", "spec_score"]:
         if c not in j.columns:
             j[c] = np.nan
@@ -528,20 +513,37 @@ def compute_performance(journal: pd.DataFrame) -> pd.DataFrame:
 # =========================
 st.sidebar.title("⚙️ Controls")
 
-universe_text = st.sidebar.text_area(
-    "Ticker universe (comma/newline separated)",
-    value=", ".join(DEFAULT_UNIVERSE),
-    height=140
+# ✅ Universe selection + daily cache for dynamic universe
+universe_mode = st.sidebar.selectbox(
+    "Universe source",
+    ["Manual list", "Dynamic (daily cached)"],
+    index=0
 )
-tickers = [t.strip().upper() for t in universe_text.replace("\n", ",").split(",") if t.strip()]
+
+if universe_mode == "Manual list":
+    universe_text = st.sidebar.text_area(
+        "Ticker universe (comma/newline separated)",
+        value=", ".join(DEFAULT_UNIVERSE),
+        height=140
+    )
+    tickers = [t.strip().upper() for t in universe_text.replace("\n", ",").split(",") if t.strip()]
+else:
+    max_symbols = st.sidebar.slider("Max symbols to scan", 50, 1000, 300, 50)
+    tickers = build_dynamic_universe_daily(
+        cache_day=dt.date.today().isoformat(),
+        max_symbols=int(max_symbols),
+    )
+
 tickers = list(dict.fromkeys(tickers))
 
-# ✅ Universe validation: US stocks only, no ETFs
+# ✅ Universe validation (US stocks only, no ETFs)
 tickers_valid, universe_audit = filter_universe_us_stocks(tickers)
+
 with st.sidebar.expander("🧭 Universe validation (US stocks only • no ETFs)", expanded=False):
+    st.write(f"Universe mode: {universe_mode}")
     st.write(f"Input tickers: {len(tickers)}")
     st.write(f"Passing filter: {len(tickers_valid)}")
-    st.dataframe(universe_audit, use_container_width=True, height=220)
+    st.dataframe(universe_audit, use_container_width=True, height=240)
 
 tickers = tickers_valid
 if not tickers:
@@ -608,12 +610,13 @@ if refresh:
     fetch_news.clear()
     finnhub_earnings_calendar_bulk.clear()
     finnhub_company_news_daily.clear()
+    # Universe caches live in universe.py; Streamlit will expire them by TTL automatically.
 
 with st.spinner("Fetching market data..."):
     history = fetch_history(tickers, period=period)
 
 if not history:
-    st.error("No price history returned for validated tickers. Try different symbols or a longer period.")
+    st.error("No price history returned for validated tickers. Try different symbols, fewer symbols, or a longer period.")
     st.stop()
 
 scores = build_scores(history, cfg)
@@ -918,3 +921,63 @@ with tab1:
         if not rows_to_log:
             st.warning("No rows to log (all allocations are $0).")
         else:
+            append_to_journal(rows_to_log)
+            st.success(f"Logged {len(rows_to_log)} rows to {JOURNAL_FILE}.")
+
+with tab2:
+    st.subheader("📒 Decision Journal + Performance")
+    journal = load_journal()
+
+    if journal.empty:
+        st.info("No journal entries yet. Go to Recommendations and click **Log allocation to journal**.")
+    else:
+        st.write("**Raw journal entries**")
+        st.dataframe(journal, use_container_width=True, height=240)
+
+        st.divider()
+        st.write(f"**Performance vs {BENCHMARK_TICKER}**")
+        with st.spinner("Calculating performance (fetching latest prices)…"):
+            perf = compute_performance(journal)
+
+        cols = [
+            "date", "ticker", "allocation_$", "buy_price", "current_price",
+            "return_%", "bench_return_%", "alpha_vs_bench_%", "spec_score",
+            "next_earnings_est", "news_count", "note"
+        ]
+        cols = [c for c in cols if c in perf.columns]
+        view = perf[cols].copy()
+
+        st.dataframe(
+            view.style.format({
+                "allocation_$": "${:.2f}",
+                "buy_price": "${:.2f}",
+                "current_price": "${:.2f}",
+                "return_%": "{:.2f}%",
+                "bench_return_%": "{:.2f}%",
+                "alpha_vs_bench_%": "{:.2f}%",
+                "spec_score": "{:.1f}",
+            }),
+            use_container_width=True,
+            height=350
+        )
+
+        total_alloc = float(perf["allocation_$"].sum()) if "allocation_$" in perf.columns else 0.0
+        weighted = (
+            (perf["return_%"] * (perf["allocation_$"] / total_alloc)).sum()
+            if total_alloc else perf["return_%"].mean()
+        )
+        st.metric("Allocation-weighted return (journal)", f"{weighted:.2f}%")
+
+        st.caption("Streamlit Community Cloud file storage can be ephemeral. Use the download/upload below to back up and restore your journal.")
+        csv_bytes = journal.to_csv(index=False).encode("utf-8")
+        st.download_button("Download journal CSV", data=csv_bytes, file_name=JOURNAL_FILE, mime="text/csv")
+
+        st.write("**Restore journal from CSV**")
+        up = st.file_uploader("Upload a previously downloaded journal CSV", type=["csv"])
+        if up is not None:
+            try:
+                df_up = pd.read_csv(up)
+                df_up.to_csv(journal_path(), index=False)
+                st.success("Journal restored. Refresh the page to see updates.")
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
