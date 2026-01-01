@@ -395,10 +395,13 @@ def fetch_close_on_or_after(ticker: str, date_iso: str) -> float:
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_next_earnings_date(ticker: str) -> Optional[str]:
-    # Finnhub primary
-    d = finnhub_next_earnings_date(ticker)
-    if d:
-        return d
+    today = dt.date.today()
+    to_day = today + dt.timedelta(days=180)
+    cache_day = today.isoformat()
+
+    cal_df = finnhub_earnings_calendar_bulk(today.isoformat(), to_day.isoformat(), cache_day)
+    earnings_map = build_next_earnings_map(cal_df)
+    return earnings_map.get(ticker.upper().strip(), None)
 
     # Optional fallback to yfinance (keeps behavior if Finnhub misses)
     try:
