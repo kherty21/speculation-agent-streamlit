@@ -1,4 +1,4 @@
-# Speculation Stock Agent (Decision Logging + Performance Tracking)
+# Speculation Stock Agent
 
 Adds:
 - Decision logging to `decision_journal.csv`
