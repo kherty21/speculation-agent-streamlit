@@ -488,8 +488,6 @@ with tab1:
         use_container_width=True,
         height=360
     )
-
-    st.divider()
     st.divider()
     st.subheader("🧭 Upcoming catalysts across Top N")
     st.caption("Scan next earnings dates + count of recent news items so you can spot catalyst-heavy names quickly.")
