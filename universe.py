@@ -1,10 +1,10 @@
 # universe.py
 """
-Universe validation helpers:
-- US stocks only (NYSE/NASDAQ/AMEX)
-- Exclude ETFs/funds/trusts/ETNs (best-effort)
-- Cached Finnhub profile2 calls (per ticker per day)
-- More efficient: optional bulk lookup of the full US symbol list (cached) to pre-filter
+Universe utilities:
+- Pull Finnhub US symbol list (cached weekly)
+- Build a dynamic daily-cached universe (subset) from the US list
+- Validate US common stock (best-effort) using Finnhub profile2 (cached per ticker per day)
+- Provide an audit table for UI
 """
 
 import os
@@ -17,43 +17,35 @@ import requests
 
 
 # -------------------------
-# Keys + HTTP
+# Finnhub key
 # -------------------------
 def get_finnhub_key() -> Optional[str]:
-    """
-    Reads Finnhub key from Streamlit secrets or env var.
-    """
     try:
         k = st.secrets.get("FINNHUB_API_KEY", None)
     except Exception:
         k = None
-    return (k or os.getenv("FINNHUB_API_KEY") or "").strip() or None
+    k = (k or os.getenv("FINNHUB_API_KEY") or "").strip()
+    return k or None
 
 
-def _session() -> requests.Session:
-    """
-    Reuse HTTP connections for speed (especially on cloud).
-    """
+# -------------------------
+# Shared HTTP session
+# -------------------------
+@st.cache_resource(show_spinner=False)
+def get_http_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "speculation-agent/1.0"})
     return s
 
 
 # -------------------------
-# Optional: bulk symbol list (fast local filter)
+# Finnhub US symbol list (weekly cached)
 # -------------------------
 @st.cache_data(ttl=7 * 24 * 60 * 60, show_spinner=False)
 def finnhub_symbols_us(cache_week: str) -> pd.DataFrame:
     """
-    Downloads Finnhub US symbol list once per week.
-    Used to pre-filter obvious non-US symbols and reduce profile2 calls.
-    Requires FINNHUB_API_KEY.
-
-    Returns a DataFrame with at least:
-      - symbol
-      - description
-      - type
-      - mic (may exist)
+    Finnhub US symbol list, cached weekly.
+    Returns columns if present: symbol, description, type, mic, currency, figi
     """
     token = get_finnhub_key()
     if not token:
@@ -63,7 +55,7 @@ def finnhub_symbols_us(cache_week: str) -> pd.DataFrame:
     params = {"exchange": "US", "token": token}
 
     try:
-        r = _session().get(url, params=params, timeout=20)
+        r = get_http_session().get(url, params=params, timeout=20)
         if r.status_code != 200:
             return pd.DataFrame()
         data = r.json() or []
@@ -71,45 +63,71 @@ def finnhub_symbols_us(cache_week: str) -> pd.DataFrame:
             return pd.DataFrame()
         df = pd.DataFrame(data)
 
-        # Standardize expected columns if present
         for col in ["symbol", "description", "type", "mic", "currency", "figi"]:
             if col not in df.columns:
                 df[col] = ""
 
         df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
         df["type"] = df["type"].astype(str).str.upper().str.strip()
+        df["description"] = df["description"].astype(str).str.strip()
         return df
     except Exception:
         return pd.DataFrame()
 
 
-def _prefilter_using_symbol_list(tickers: List[str], sym_df: pd.DataFrame) -> Tuple[List[str], Dict[str, str]]:
+# -------------------------
+# Daily-cached dynamic universe builder
+# -------------------------
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def build_dynamic_universe_daily(
+    cache_day: str,
+    max_symbols: int = 300,
+    allowed_symbol_pattern: str = r"^[A-Z\.\-]{1,6}$",
+    include_types: Tuple[str, ...] = ("COMMON STOCK", "EQUITY"),
+) -> List[str]:
     """
-    Returns (candidates, reason_map) after prefiltering with Finnhub symbol list.
-    This does not guarantee "common stock", but it reduces calls.
-    """
-    reason: Dict[str, str] = {}
-    if sym_df is None or sym_df.empty or "symbol" not in sym_df.columns:
-        return tickers, reason
+    Builds a dynamic universe from Finnhub's US symbol list and caches it daily.
+    This is a *candidate* list; you'll still validate tickers via profile2 in filter_universe_us_stocks.
 
-    symbols = set(sym_df["symbol"].dropna().astype(str).str.upper().str.strip().tolist())
-    candidates: List[str] = []
-    for t in tickers:
-        if t in symbols:
-            candidates.append(t)
-        else:
-            reason[t] = "Not in Finnhub US symbol list"
-    return candidates, reason
+    include_types:
+      Finnhub 'type' is not perfectly standardized; include a few common equity-like strings.
+
+    Note: We do not do expensive per-symbol calls here. This is intentionally cheap.
+    """
+    token = get_finnhub_key()
+    if not token:
+        return []
+
+    cache_week = dt.date.today().strftime("%G-W%V")
+    df = finnhub_symbols_us(cache_week=cache_week)
+    if df.empty:
+        return []
+
+    df = df.copy()
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+    df["type"] = df["type"].astype(str).str.upper().str.strip()
+
+    # keep equity-like types (best-effort)
+    inc = set([t.upper() for t in include_types])
+    df = df[df["type"].isin(inc)]
+
+    # remove weird symbols
+    df = df[df["symbol"].str.match(allowed_symbol_pattern, na=False)]
+
+    # de-dup, stable-ish ordering
+    tickers = df["symbol"].dropna().unique().tolist()
+
+    # cap
+    return tickers[: int(max_symbols)]
 
 
 # -------------------------
-# Per-ticker profile lookup
+# Profile2 (daily cached per ticker)
 # -------------------------
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def finnhub_company_profile(ticker: str, cache_day: str) -> dict:
     """
     Finnhub profile2 cached per ticker per day.
-    cache_day is today's date string to force daily refresh.
     """
     token = get_finnhub_key()
     if not token:
@@ -119,33 +137,28 @@ def finnhub_company_profile(ticker: str, cache_day: str) -> dict:
     params = {"symbol": ticker, "token": token}
 
     try:
-        r = _session().get(url, params=params, timeout=10)
+        r = get_http_session().get(url, params=params, timeout=10)
         if r.status_code != 200:
             return {}
         data = r.json() or {}
-        # Finnhub sometimes returns {} for unknowns; normalize to dict
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-# -------------------------
-# Validation rules
-# -------------------------
-_ETF_NAME_KEYWORDS = (
-    " etf", " fund", " trust", " index", " etn", " ucits", " spdr", " ishares", " vanguard"
-)
-
 _ALLOWED_EXCHANGES = {"NYSE", "NASDAQ", "AMEX"}
+_ETF_NAME_KEYWORDS = (
+    " etf", " fund", " trust", " index", " etn", " ucits",
+    " spdr", " ishares", " vanguard"
+)
 
 
 def is_valid_us_common_stock(profile: dict) -> Tuple[bool, str]:
     """
     Returns (is_valid, reason).
-    Best-effort validation: US-listed on major exchanges + exclude ETF-like names.
     """
     if not profile:
-        return False, "Missing profile (bad symbol or API limit)"
+        return False, "Missing profile (bad symbol / API limit / no coverage)"
 
     exchange = (profile.get("exchange") or "").upper().strip()
     country = (profile.get("country") or "").upper().strip()
@@ -159,7 +172,6 @@ def is_valid_us_common_stock(profile: dict) -> Tuple[bool, str]:
     if currency != "USD":
         return False, f"Currency not USD ({currency or 'blank'})"
 
-    # Heuristic ETF/fund detection via name keywords
     if name:
         padded = f" {name} "
         if any(k in padded for k in _ETF_NAME_KEYWORDS):
@@ -168,22 +180,17 @@ def is_valid_us_common_stock(profile: dict) -> Tuple[bool, str]:
     return True, "OK"
 
 
-# -------------------------
-# Public API
-# -------------------------
 def filter_universe_us_stocks(
     tickers: List[str],
-    use_symbol_list_prefilter: bool = True
 ) -> Tuple[List[str], pd.DataFrame]:
     """
-    Filters tickers to (US stocks only, no ETFs) and returns (valid_tickers, audit_df).
-
-    Efficiency:
-    - Optional weekly-cached Finnhub US symbol list prefilter to reduce profile2 calls
-    - Daily-cached Finnhub profile2 per ticker
+    Returns (valid_tickers, audit_df).
+    Uses Finnhub profile2 per ticker (cached daily).
     """
-    # Normalize / dedupe
-    clean = []
+    cache_day = dt.date.today().isoformat()
+
+    # normalize & dedupe
+    clean: List[str] = []
     seen = set()
     for t in tickers:
         t = (t or "").strip().upper()
@@ -192,41 +199,19 @@ def filter_universe_us_stocks(
         seen.add(t)
         clean.append(t)
 
-    cache_day = dt.date.today().isoformat()
-
-    # Prefilter using symbol list (reduces profile calls)
-    prefilter_reason: Dict[str, str] = {}
-    candidates = clean
-    if use_symbol_list_prefilter:
-        cache_week = dt.date.today().strftime("%G-W%V")  # ISO week key
-        sym_df = finnhub_symbols_us(cache_week=cache_week)
-        candidates, prefilter_reason = _prefilter_using_symbol_list(clean, sym_df)
-
     rows = []
-    valid: List[str] = []
+    valid = []
 
     for t in clean:
-        if t not in candidates:
-            rows.append({
-                "Ticker": t,
-                "Name": "",
-                "Exchange": "",
-                "Country": "",
-                "Currency": "",
-                "Valid US Stock": False,
-                "Reason": prefilter_reason.get(t, "Filtered by precheck"),
-            })
-            continue
-
         profile = finnhub_company_profile(t, cache_day=cache_day)
         ok, reason = is_valid_us_common_stock(profile)
 
         rows.append({
             "Ticker": t,
-            "Name": profile.get("name", "") if isinstance(profile, dict) else "",
-            "Exchange": profile.get("exchange", "") if isinstance(profile, dict) else "",
-            "Country": profile.get("country", "") if isinstance(profile, dict) else "",
-            "Currency": profile.get("currency", "") if isinstance(profile, dict) else "",
+            "Name": profile.get("name", ""),
+            "Exchange": profile.get("exchange", ""),
+            "Country": profile.get("country", ""),
+            "Currency": profile.get("currency", ""),
             "Valid US Stock": bool(ok),
             "Reason": reason,
         })
@@ -236,32 +221,3 @@ def filter_universe_us_stocks(
 
     audit_df = pd.DataFrame(rows)
     return valid, audit_df
-
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def build_dynamic_universe_from_finnhub(
-    cache_day: str,
-    exchanges: tuple = ("NYSE", "NASDAQ", "AMEX"),
-    max_symbols: int = 400,
-    include_types: tuple = ("COMMON STOCK", "EQUITY"),
-) -> List[str]:
-    """
-    Returns a candidate ticker universe from Finnhub's US symbol list.
-    """
-    cache_week = dt.date.today().strftime("%G-W%V")
-    df = finnhub_symbols_us(cache_week=cache_week)
-    if df.empty:
-        return []
-
-    # Finnhub symbol list provides "type" but may not map perfectly
-    df["type"] = df["type"].astype(str).str.upper().str.strip()
-    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
-
-    # Keep only plausible equity/common stock-like entries
-    df = df[df["type"].isin([t.upper() for t in include_types])]
-
-    # Basic cleanup: remove weird symbols (optional)
-    df = df[df["symbol"].str.match(r"^[A-Z\.\-]{1,6}$", na=False)]
-
-    tickers = df["symbol"].dropna().unique().tolist()
-    return tickers[:max_symbols]
-
