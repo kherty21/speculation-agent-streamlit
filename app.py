@@ -35,6 +35,9 @@ class ScoreConfig:
     min_price: float = 2.0
     max_drawdown_cap: float = 0.60
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def to_series(x):
     if isinstance(x, pd.DataFrame):
         if x.shape[1] == 0:
@@ -192,11 +195,11 @@ def days_until(date_iso: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
-def catalyst_score(next_earnings_iso: Optional[str], news_items: List[dict]) -> float:
+def catalyst_score(next_earnings_iso: Optional[str], news_items: List[dict], news_recency_hours: int = 72) -> float:
     """
     Simple heuristic catalyst score (0-100):
     - Earnings within 0-21 days contributes up to 60 points
-    - Recent news (last 72h) contributes up to 40 points
+    - Recent news within recency window contributes up to 40 points
     """
     score = 0.0
     dte = days_until(next_earnings_iso)
@@ -209,7 +212,7 @@ def catalyst_score(next_earnings_iso: Optional[str], news_items: List[dict]) -> 
     recent = 0
     for it in news_items:
         ah = it.get("age_hours")
-        if ah is not None and not pd.isna(ah) and ah <= 72:
+        if ah is not None and not pd.isna(ah) and ah <= news_recency_hours:
             recent += 1
     score += min(40.0, recent * 10.0)
 
@@ -424,7 +427,8 @@ refresh = st.sidebar.button("🔄 Refresh data")
 st.sidebar.divider()
 st.sidebar.subheader("🗞️ Catalysts")
 news_limit = st.sidebar.slider("News items per ticker", 3, 20, 10)
-news_recency_hours = st.sidebar.slider("Recency window for 'Recent' badge (hours)", 24, 240, 72, 24)
+news_recency_hours = st.sidebar.slider("News recency window (hours)", 24, 240, 72, 24)
+scan_days = st.sidebar.slider("Earnings scan window (days)", 7, 120, 45, 7)
 
 st.sidebar.divider()
 st.sidebar.subheader("🤖 LLM thesis (optional)")
@@ -482,9 +486,108 @@ with tab1:
             "6M Momentum":"{:.1%}","Vol (ann.)":"{:.0%}","Volume Z":"{:.2f}","RSI":"{:.0f}","Max DD (period)":"{:.0%}",
         }),
         use_container_width=True,
-        height=380
+        height=360
     )
 
+    st.divider()
+        st.divider()
+    st.subheader("🧭 Upcoming catalysts across Top N")
+    st.caption("Scan next earnings dates + count of recent news items so you can spot catalyst-heavy names quickly.")
+
+    # Controls for table behavior
+    sort_by = st.selectbox(
+        "Sort by",
+        ["Earnings soonest", "Catalyst score", "Spec score"],
+        index=0,
+        help="Choose how to sort the catalyst scan table."
+    )
+    only_earnings_window = st.checkbox(
+        "Only show tickers with earnings in the next X days",
+        value=False
+    )
+    earnings_window_days = st.slider(
+        "X (days)",
+        7, 120, int(scan_days), 7,
+        disabled=not only_earnings_window
+    )
+
+    scan_btn = st.button("Scan catalysts for Top N")
+    if "catalyst_table" not in st.session_state:
+        st.session_state["catalyst_table"] = None
+
+    if scan_btn or st.session_state["catalyst_table"] is None:
+        rows = []
+        with st.spinner("Scanning earnings + news for Top N…"):
+            for t in list(top.index):
+                e = fetch_next_earnings_date(t)
+                dte = days_until(e)
+                news = fetch_news(t, limit=int(news_limit))
+                recent_news = 0
+                for it in news:
+                    ah = it.get("age_hours")
+                    if ah is not None and not pd.isna(ah) and ah <= news_recency_hours:
+                        recent_news += 1
+
+                # include spec score for sorting/visibility
+                spec = float(top.loc[t, "spec_score"]) if "spec_score" in top.columns else float(eligible.loc[t, "spec_score"])
+                cat = catalyst_score(e, news, news_recency_hours=news_recency_hours)
+                within_window_default = (dte is not None) and (0 <= dte <= scan_days)
+
+                rows.append({
+                    "Ticker": t,
+                    "Spec Score": round(spec, 1),
+                    "Next earnings (est.)": e or "",
+                    "Days to earnings": dte if dte is not None else np.nan,
+                    f"Recent news (<= {news_recency_hours}h)": int(recent_news),
+                    "Total news (fetched)": int(len(news)),
+                    "Catalyst Score": round(cat, 1),
+                    f"Earnings within {scan_days}d": bool(within_window_default),
+                })
+
+        tbl = pd.DataFrame(rows)
+
+        # Default sort applied after scan based on user selection
+        if sort_by == "Earnings soonest":
+            if "Days to earnings" in tbl.columns:
+                tbl = tbl.sort_values(["Days to earnings", "Catalyst Score", "Spec Score"], ascending=[True, False, False], na_position="last")
+        elif sort_by == "Catalyst score":
+            tbl = tbl.sort_values(["Catalyst Score", "Days to earnings", "Spec Score"], ascending=[False, True, False], na_position="last")
+        else:  # Spec score
+            tbl = tbl.sort_values(["Spec Score", "Catalyst Score", "Days to earnings"], ascending=[False, False, True], na_position="last")
+
+        st.session_state["catalyst_table"] = tbl
+
+    tbl = st.session_state["catalyst_table"]
+    if isinstance(tbl, pd.DataFrame) and not tbl.empty:
+        view_tbl = tbl.copy()
+
+        # Apply earnings window filter (only when checkbox enabled)
+        if only_earnings_window:
+            # keep rows with 0 <= dte <= earnings_window_days
+            if "Days to earnings" in view_tbl.columns:
+                view_tbl = view_tbl[
+                    view_tbl["Days to earnings"].notna() &
+                    (view_tbl["Days to earnings"] >= 0) &
+                    (view_tbl["Days to earnings"] <= earnings_window_days)
+                ]
+
+        # Apply sort live even after scan (lets user change dropdown without re-scan)
+        if not view_tbl.empty:
+            if sort_by == "Earnings soonest":
+                view_tbl = view_tbl.sort_values(["Days to earnings", "Catalyst Score", "Spec Score"], ascending=[True, False, False], na_position="last")
+            elif sort_by == "Catalyst score":
+                view_tbl = view_tbl.sort_values(["Catalyst Score", "Days to earnings", "Spec Score"], ascending=[False, True, False], na_position="last")
+            else:
+                view_tbl = view_tbl.sort_values(["Spec Score", "Catalyst Score", "Days to earnings"], ascending=[False, False, True], na_position="last")
+
+        st.dataframe(view_tbl, use_container_width=True, height=320)
+
+        csv_bytes = view_tbl.to_csv(index=False).encode("utf-8")
+        st.download_button("Download catalyst scan CSV", data=csv_bytes, file_name="catalyst_scan_topN.csv", mime="text/csv")
+    else:
+        st.info("Click **Scan catalysts for Top N** to populate the table.")
+
+    st.divider()
     st.subheader("🔎 Explore a Ticker")
     ticker_sel = st.selectbox("Select ticker", options=list(top.index), index=0)
     df = history[ticker_sel].copy().rename(columns=str.title)
@@ -507,11 +610,11 @@ with tab1:
         st.metric("Max drawdown", f"{row['max_drawdown']*100:.0f}%" if not pd.isna(row["max_drawdown"]) else "n/a")
 
     st.divider()
-    st.subheader("🗓️ Catalysts: Earnings + News")
+    st.subheader("🗓️ Catalysts (selected ticker): Earnings + News")
     next_earnings = fetch_next_earnings_date(ticker_sel)
     dte = days_until(next_earnings)
     news = fetch_news(ticker_sel, limit=int(news_limit))
-    cat = catalyst_score(next_earnings, news)
+    cat = catalyst_score(next_earnings, news, news_recency_hours=news_recency_hours)
 
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
@@ -520,8 +623,6 @@ with tab1:
         st.metric("Next earnings (est.)", next_earnings or "n/a")
     with c3:
         st.metric("Days to earnings", f"{dte}" if dte is not None else "n/a")
-
-    st.caption("Earnings dates and news are best-effort via public feeds through yfinance; verify before trading.")
 
     if news:
         for it in news:

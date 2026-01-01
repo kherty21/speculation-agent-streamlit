@@ -1,10 +1,11 @@
-# Speculation Stock Agent (Earnings + News Catalyst Panel)
+# Speculation Stock Agent (Top N Catalyst Scan)
 
-Adds a per-ticker catalyst panel:
-- Next earnings date (best-effort from yfinance)
-- Recent news list (best-effort from yfinance)
-- Simple "Catalyst Score" heuristic (earnings proximity + news recency)
+Adds an "Upcoming catalysts across Top N" table:
+- scans next earnings date (best-effort)
+- counts recent news items within your selected recency window
+- computes a simple catalyst score
+- export to CSV
 
 Also includes:
 - Decision logging + performance tracking
-- Optional LLM-assisted thesis + invalidation rules
+- Optional LLM thesis + invalidation rules
