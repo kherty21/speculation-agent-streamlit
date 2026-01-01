@@ -1,5 +1,6 @@
 import os
 import math
+import json
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Dict
@@ -10,7 +11,6 @@ import yfinance as yf
 import streamlit as st
 
 # Optional: LLM-assisted thesis generation (OpenAI)
-# Requires: pip install openai, and env var OPENAI_API_KEY set.
 try:
     from openai import OpenAI
     _OPENAI_AVAILABLE = True
@@ -24,17 +24,18 @@ DEFAULT_UNIVERSE = [
     "SHOP","DDOG","MDB","CRSP","BE","QS","DKNG","ASTS","IONQ","RKLB"
 ]
 
+JOURNAL_FILE = "decision_journal.csv"
+BENCHMARK_TICKER = "QQQ"
+
 @dataclass
 class ScoreConfig:
-    lookback_days: int = 252   # ~1 trading year
-    momentum_window: int = 126 # ~6 months
-    vol_window: int = 63       # ~3 months
-    vol_spike_window: int = 20 # ~1 month
+    momentum_window: int = 126
+    vol_window: int = 63
+    vol_spike_window: int = 20
     min_price: float = 2.0
     max_drawdown_cap: float = 0.60
 
 def to_series(x):
-    """Coerce yfinance columns to a 1D Series safely."""
     if isinstance(x, pd.DataFrame):
         if x.shape[1] == 0:
             return pd.Series(dtype="float64")
@@ -68,18 +69,12 @@ def zscore_latest(series: pd.Series, window: int) -> float:
     return float((w.iloc[-1] - mu) / sigma)
 
 def normalize_0_100(value, vmin: float, vmax: float):
-    """
-    Normalize a scalar OR pandas Series to a 0–100 scale.
-    Returns same type as input (float for scalar, Series for Series).
-    """
     if vmax == vmin or pd.isna(vmin) or pd.isna(vmax):
         if isinstance(value, pd.Series):
             return pd.Series(50.0, index=value.index)
         return 50.0
-
     if isinstance(value, pd.Series):
         return 100.0 * (value - vmin) / (vmax - vmin)
-
     if pd.isna(value):
         return float("nan")
     return float(100.0 * (value - vmin) / (vmax - vmin))
@@ -96,6 +91,32 @@ def fetch_history(tickers: List[str], period: str = "1y") -> Dict[str, pd.DataFr
         except Exception:
             continue
     return data
+
+@st.cache_data(ttl=30*60, show_spinner=False)
+def fetch_last_close(ticker: str) -> float:
+    try:
+        df = yf.download(ticker, period="7d", auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            return float("nan")
+        df = df.rename(columns=str.title)
+        c = to_series(df["Close"]).dropna()
+        return float(c.iloc[-1]) if len(c) else float("nan")
+    except Exception:
+        return float("nan")
+
+@st.cache_data(ttl=60*60, show_spinner=False)
+def fetch_close_on_or_after(ticker: str, date_iso: str) -> float:
+    try:
+        d0 = dt.date.fromisoformat(date_iso)
+        d1 = d0 + dt.timedelta(days=7)
+        df = yf.download(ticker, start=d0.isoformat(), end=d1.isoformat(), auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            return float("nan")
+        df = df.rename(columns=str.title)
+        c = to_series(df["Close"]).dropna()
+        return float(c.iloc[0]) if len(c) else float("nan")
+    except Exception:
+        return float("nan")
 
 def score_ticker(df: pd.DataFrame, cfg: ScoreConfig) -> Dict[str, float]:
     close = to_series(df["Close"]).dropna()
@@ -187,20 +208,6 @@ def suggest_allocation(top: pd.DataFrame, monthly_budget: float, mode: str) -> p
     out["allocation_$"] = pd.Series(alloc, index=out.index).round(2)
     return out
 
-def rationale_row(row: pd.Series) -> str:
-    parts = []
-    for label, key, fmt in [
-        ("6M momentum", "momentum_6m", lambda v: f"{v*100:.1f}%"),
-        ("volatility (ann.)", "vol_ann", lambda v: f"{v*100:.0f}%"),
-        ("volume z-score", "vol_z", lambda v: f"{v:.2f}"),
-        ("RSI", "rsi", lambda v: f"{v:.0f}"),
-        ("max drawdown (period)", "max_drawdown", lambda v: f"{v*100:.0f}%"),
-    ]:
-        v = row.get(key, np.nan)
-        if not pd.isna(v):
-            parts.append(f"{label}: {fmt(float(v))}")
-    return " • ".join(parts)
-
 def summarize_metrics_for_llm(ticker: str, row: pd.Series) -> str:
     return (
         f"Ticker: {ticker}\n"
@@ -217,7 +224,7 @@ def llm_thesis_and_invalidation(ticker: str, metrics_text: str, model: str, temp
     if not _OPENAI_AVAILABLE:
         raise RuntimeError("OpenAI SDK not installed. Add `openai` to requirements and install it.")
 
-    client = OpenAI()  # reads OPENAI_API_KEY from env
+    client = OpenAI()
     prompt = f"""
 You are an investing assistant helping a user build a speculative ($100/month) high-risk growth watchlist.
 Generate a concise, decision-useful thesis and explicit invalidation rules for the ticker.
@@ -249,35 +256,71 @@ Metrics:
             text = ""
     text = (text or "").strip()
 
-    import json, re
     try:
         return json.loads(text)
     except Exception:
+        import re
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m:
             return json.loads(m.group(0))
         raise
 
+# --- Journal ---
+def journal_path() -> str:
+    return os.path.join(os.getcwd(), JOURNAL_FILE)
+
+def load_journal() -> pd.DataFrame:
+    path = journal_path()
+    if os.path.exists(path):
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def append_to_journal(rows: List[dict]) -> None:
+    path = journal_path()
+    df_new = pd.DataFrame(rows)
+    df_old = load_journal()
+    df_all = pd.concat([df_old, df_new], ignore_index=True) if not df_old.empty else df_new
+    df_all.to_csv(path, index=False)
+
+def compute_performance(journal: pd.DataFrame) -> pd.DataFrame:
+    if journal.empty:
+        return journal
+    j = journal.copy()
+
+    for c in ["date", "ticker", "buy_price", "allocation_$", "spec_score"]:
+        if c not in j.columns:
+            j[c] = np.nan
+
+    j["current_price"] = j["ticker"].apply(fetch_last_close)
+    j["return_%"] = (j["current_price"] / j["buy_price"] - 1.0) * 100.0
+
+    def bench_return(row):
+        d = str(row.get("date", ""))[:10]
+        if not d or d == "nan":
+            return float("nan")
+        b0 = fetch_close_on_or_after(BENCHMARK_TICKER, d)
+        b1 = fetch_last_close(BENCHMARK_TICKER)
+        if pd.isna(b0) or pd.isna(b1) or b0 == 0:
+            return float("nan")
+        return (b1 / b0 - 1.0) * 100.0
+
+    j["bench_return_%"] = j.apply(bench_return, axis=1)
+    j["alpha_vs_bench_%"] = j["return_%"] - j["bench_return_%"]
+    return j
+
 # -----------------------------
-# Sidebar controls
+# Sidebar
 # -----------------------------
 st.sidebar.title("⚙️ Controls")
-universe_text = st.sidebar.text_area(
-    "Ticker universe (comma or newline separated)",
-    value=", ".join(DEFAULT_UNIVERSE),
-    height=140
-)
+universe_text = st.sidebar.text_area("Ticker universe (comma/newline separated)", value=", ".join(DEFAULT_UNIVERSE), height=140)
 tickers = [t.strip().upper() for t in universe_text.replace("\n", ",").split(",") if t.strip()]
 tickers = list(dict.fromkeys(tickers))
 
 monthly_budget = st.sidebar.number_input("Monthly budget ($)", min_value=10.0, max_value=10000.0, value=100.0, step=10.0)
-
-alloc_mode = st.sidebar.selectbox(
-    "Allocation strategy",
-    ["3 picks (60/25/15)", "2 picks (70/30)", "1 pick (100%)", "Score-weighted (top N)"],
-    index=0
-)
-
+alloc_mode = st.sidebar.selectbox("Allocation strategy", ["3 picks (60/25/15)", "2 picks (70/30)", "1 pick (100%)", "Score-weighted (top N)"], index=0)
 top_n = st.sidebar.slider("How many top tickers to show", 3, 15, 10)
 min_price = st.sidebar.number_input("Min price filter ($)", min_value=0.5, max_value=100.0, value=2.0, step=0.5)
 period = st.sidebar.selectbox("History period", ["6mo", "1y", "2y"], index=1)
@@ -292,13 +335,17 @@ llm_temp = st.sidebar.slider("Temperature", 0.0, 1.0, 0.3, 0.05)
 cfg = ScoreConfig(min_price=min_price)
 
 # -----------------------------
-# Main UI
+# Main
 # -----------------------------
-st.title("📈 Speculation Stock Agent (Streamlit Prototype)")
-st.caption("Scans a ticker universe, ranks by a transparent 'Speculation Score', and suggests a $100/month allocation. For education & fun—**not financial advice**.")
+st.title("📈 Speculation Stock Agent")
+st.caption("Recommendations + thesis + decision logging + performance tracking (vs QQQ). Educational use only.")
+
+tab1, tab2 = st.tabs(["Recommendations", "Decision Journal"])
 
 if refresh:
     fetch_history.clear()
+    fetch_last_close.clear()
+    fetch_close_on_or_after.clear()
 
 with st.spinner("Fetching market data..."):
     history = fetch_history(tickers, period=period)
@@ -310,124 +357,165 @@ if not history:
 scores = build_scores(history, cfg)
 eligible = scores[scores["eligible"] == 1].copy()
 if eligible.empty:
-    st.warning("No eligible tickers after filters. Try lowering Min price filter or adjusting universe.")
+    st.warning("No eligible tickers after filters.")
     st.stop()
 
 top = eligible.head(top_n)
 rec = suggest_allocation(top, monthly_budget, alloc_mode)
 
-st.subheader("✅ This Month's Suggested Buys")
-rec_display = rec[[
-    "spec_score","allocation_$","price","momentum_6m","vol_ann","vol_z","rsi","max_drawdown"
-]].copy()
+if "thesis_cache" not in st.session_state:
+    st.session_state["thesis_cache"] = {}
 
-rec_display = rec_display.rename(columns={
-    "spec_score":"Spec Score",
-    "allocation_$":"Allocation ($)",
-    "price":"Price",
-    "momentum_6m":"6M Momentum",
-    "vol_ann":"Vol (ann.)",
-    "vol_z":"Volume Z",
-    "rsi":"RSI",
-    "max_drawdown":"Max DD (period)"
-})
+with tab1:
+    st.subheader("✅ This Month's Suggested Buys")
+    rec_display = rec[["spec_score","allocation_$","price","momentum_6m","vol_ann","vol_z","rsi","max_drawdown"]].copy()
+    rec_display = rec_display.rename(columns={
+        "spec_score":"Spec Score","allocation_$":"Allocation ($)","price":"Price","momentum_6m":"6M Momentum",
+        "vol_ann":"Vol (ann.)","vol_z":"Volume Z","rsi":"RSI","max_drawdown":"Max DD (period)"
+    })
 
-st.dataframe(
-    rec_display.style.format({
-        "Spec Score":"{:.1f}",
-        "Allocation ($)":"${:.2f}",
-        "Price":"${:.2f}",
-        "6M Momentum":"{:.1%}",
-        "Vol (ann.)":"{:.0%}",
-        "Volume Z":"{:.2f}",
-        "RSI":"{:.0f}",
-        "Max DD (period)":"{:.0%}",
-    }),
-    use_container_width=True,
-    height=380
-)
+    st.dataframe(
+        rec_display.style.format({
+            "Spec Score":"{:.1f}","Allocation ($)":"${:.2f}","Price":"${:.2f}",
+            "6M Momentum":"{:.1%}","Vol (ann.)":"{:.0%}","Volume Z":"{:.2f}","RSI":"{:.0f}","Max DD (period)":"{:.0%}",
+        }),
+        use_container_width=True,
+        height=380
+    )
 
-st.subheader("🧾 Why these picks (signal-based)")
-for t, row_iter in rec.iterrows():
-    if row_iter.get("allocation_$", 0) <= 0:
-        continue
-    with st.expander(f"{t} — Allocate ${row_iter['allocation_$']:.2f}"):
-        st.write(rationale_row(row_iter))
-        st.write("**Watch next:** earnings date, guidance changes, dilution/cash runway (if early-stage), and whether volume remains elevated.")
+    st.subheader("🔎 Explore a Ticker")
+    ticker_sel = st.selectbox("Select ticker", options=list(top.index), index=0)
+    df = history[ticker_sel].copy().rename(columns=str.title)
 
-st.divider()
+    left, right = st.columns([1.4, 1])
+    with left:
+        st.write("**Price chart (adjusted)**")
+        st.line_chart(df["Close"], height=280)
+        st.write("**Volume**")
+        st.bar_chart(df["Volume"], height=180)
 
-st.subheader("🔎 Explore a Ticker")
-ticker_sel = st.selectbox("Select ticker", options=list(top.index), index=0)
-df = history[ticker_sel].copy().rename(columns=str.title)
+    with right:
+        row = eligible.loc[ticker_sel]
+        st.metric("Speculation Score", f"{row['spec_score']:.1f}")
+        st.metric("Price", f"${row['price']:.2f}")
+        st.metric("6M Momentum", f"{row['momentum_6m']*100:.1f}%" if not pd.isna(row["momentum_6m"]) else "n/a")
+        st.metric("Volatility (ann.)", f"{row['vol_ann']*100:.0f}%" if not pd.isna(row["vol_ann"]) else "n/a")
+        st.metric("Volume z-score", f"{row['vol_z']:.2f}" if not pd.isna(row["vol_z"]) else "n/a")
+        st.metric("RSI", f"{row['rsi']:.0f}" if not pd.isna(row["rsi"]) else "n/a")
+        st.metric("Max drawdown", f"{row['max_drawdown']*100:.0f}%" if not pd.isna(row["max_drawdown"]) else "n/a")
 
-left, right = st.columns([1.4, 1])
-with left:
-    st.write("**Price chart (adjusted)**")
-    st.line_chart(df["Close"], height=280)
-    st.write("**Volume**")
-    st.bar_chart(df["Volume"], height=180)
-
-with right:
-    row = eligible.loc[ticker_sel]
-    st.metric("Speculation Score", f"{row['spec_score']:.1f}")
-    st.metric("Price", f"${row['price']:.2f}")
-    st.metric("6M Momentum", f"{row['momentum_6m']*100:.1f}%" if not pd.isna(row["momentum_6m"]) else "n/a")
-    st.metric("Volatility (ann.)", f"{row['vol_ann']*100:.0f}%" if not pd.isna(row["vol_ann"]) else "n/a")
-    st.metric("Volume z-score", f"{row['vol_z']:.2f}" if not pd.isna(row["vol_z"]) else "n/a")
-    st.metric("RSI", f"{row['rsi']:.0f}" if not pd.isna(row["rsi"]) else "n/a")
-    st.metric("Max drawdown", f"{row['max_drawdown']*100:.0f}%" if not pd.isna(row["max_drawdown"]) else "n/a")
-
-if llm_enabled:
-    st.subheader("🤖 Thesis + Invalidation Rules (LLM-assisted)")
-    if not _OPENAI_AVAILABLE:
-        st.warning("OpenAI SDK not installed. Add `openai` to requirements.txt and reinstall.")
-    else:
-        if "thesis_cache" not in st.session_state:
-            st.session_state["thesis_cache"] = {}
-
-        metrics_text = summarize_metrics_for_llm(ticker_sel, row)
-
-        col1, col2 = st.columns([1, 1])
-        with col1:
+    if llm_enabled:
+        st.subheader("🤖 Thesis + Invalidation Rules")
+        if not _OPENAI_AVAILABLE:
+            st.warning("OpenAI SDK not installed. Add `openai` to requirements and reinstall.")
+        else:
+            metrics_text = summarize_metrics_for_llm(ticker_sel, row)
             st.code(metrics_text, language="text")
-        with col2:
-            st.info("This generates **hypotheses**, not facts. It uses only the metrics shown as quantitative evidence.")
+            gen = st.button("Generate / Refresh thesis for selected ticker")
+            cache_key = f"{ticker_sel}:{llm_model}:{llm_temp:.2f}"
 
-        gen = st.button("Generate / Refresh thesis for selected ticker")
-        cache_key = f"{ticker_sel}:{llm_model}:{llm_temp:.2f}"
+            if gen or (cache_key not in st.session_state["thesis_cache"]):
+                try:
+                    with st.spinner("Calling OpenAI…"):
+                        st.session_state["thesis_cache"][cache_key] = llm_thesis_and_invalidation(
+                            ticker_sel, metrics_text, model=llm_model, temperature=float(llm_temp)
+                        )
+                except Exception as e:
+                    st.error(f"LLM call failed: {e}")
 
-        if gen or (cache_key not in st.session_state["thesis_cache"]):
+            result = st.session_state["thesis_cache"].get(cache_key)
+            if isinstance(result, dict):
+                cA, cB = st.columns([1, 1])
+                with cA:
+                    st.markdown("### Thesis (why it could run)")
+                    for b in result.get("thesis_bullets", []):
+                        st.write(f"• {b}")
+                    st.markdown("### Key risks")
+                    for b in result.get("key_risks", []):
+                        st.write(f"• {b}")
+                with cB:
+                    st.markdown("### Invalidation triggers")
+                    for b in result.get("invalidation_triggers", []):
+                        st.write(f"• {b}")
+                    st.markdown("### Monitoring questions")
+                    for b in result.get("monitoring_questions", []):
+                        st.write(f"• {b}")
+
+    st.divider()
+    st.subheader("📝 Log this month's buys")
+    decision_date = st.date_input("Decision date", value=dt.date.today())
+    note = st.text_input("Note (optional)", value="")
+    st.caption(f"Will log rows with Allocation > $0 to `{JOURNAL_FILE}`.")
+
+    if st.button("Log allocation to journal"):
+        rows_to_log = []
+        for t, r in rec.iterrows():
+            alloc = float(r.get("allocation_$", 0) or 0)
+            if alloc <= 0:
+                continue
+            thesis_obj = None
+            ck = f"{t}:{llm_model}:{llm_temp:.2f}"
+            if ck in st.session_state["thesis_cache"]:
+                thesis_obj = st.session_state["thesis_cache"][ck]
+
+            rows_to_log.append({
+                "date": decision_date.isoformat(),
+                "ticker": t,
+                "allocation_$": float(alloc),
+                "buy_price": float(r.get("price", np.nan)),
+                "spec_score": float(r.get("spec_score", np.nan)),
+                "alloc_mode": alloc_mode,
+                "universe_size": len(tickers),
+                "note": note,
+                "thesis_json": json.dumps(thesis_obj) if thesis_obj else "",
+                "logged_at": dt.datetime.now().isoformat(timespec="seconds"),
+            })
+
+        if not rows_to_log:
+            st.warning("No rows to log (all allocations are $0).")
+        else:
+            append_to_journal(rows_to_log)
+            st.success(f"Logged {len(rows_to_log)} rows to {JOURNAL_FILE}.")
+
+with tab2:
+    st.subheader("📒 Decision Journal + Performance")
+    journal = load_journal()
+    if journal.empty:
+        st.info("No journal entries yet. Go to Recommendations and click **Log allocation to journal**.")
+    else:
+        st.write("**Raw journal entries**")
+        st.dataframe(journal, use_container_width=True, height=240)
+
+        st.divider()
+        st.write(f"**Performance vs {BENCHMARK_TICKER}**")
+        with st.spinner("Calculating performance (fetching latest prices)…"):
+            perf = compute_performance(journal)
+
+        cols = ["date","ticker","allocation_$","buy_price","current_price","return_%","bench_return_%","alpha_vs_bench_%","spec_score","note"]
+        view = perf[cols].copy()
+        st.dataframe(
+            view.style.format({
+                "allocation_$":"${:.2f}","buy_price":"${:.2f}","current_price":"${:.2f}",
+                "return_%":"{:.2f}%","bench_return_%":"{:.2f}%","alpha_vs_bench_%":"{:.2f}%","spec_score":"{:.1f}",
+            }),
+            use_container_width=True,
+            height=330
+        )
+
+        total_alloc = float(perf["allocation_$"].sum()) if "allocation_$" in perf.columns else 0.0
+        weighted = (perf["return_%"] * (perf["allocation_$"] / total_alloc)).sum() if total_alloc else perf["return_%"].mean()
+        st.metric("Allocation-weighted return (journal)", f"{weighted:.2f}%")
+
+        st.caption("Streamlit Community Cloud file storage can be ephemeral. Use the download/upload below to back up and restore your journal.")
+        csv_bytes = journal.to_csv(index=False).encode("utf-8")
+        st.download_button("Download journal CSV", data=csv_bytes, file_name=JOURNAL_FILE, mime="text/csv")
+
+        st.write("**Restore journal from CSV**")
+        up = st.file_uploader("Upload a previously downloaded journal CSV", type=["csv"])
+        if up is not None:
             try:
-                with st.spinner("Calling OpenAI…"):
-                    st.session_state["thesis_cache"][cache_key] = llm_thesis_and_invalidation(
-                        ticker_sel, metrics_text, model=llm_model, temperature=float(llm_temp)
-                    )
+                df_up = pd.read_csv(up)
+                df_up.to_csv(journal_path(), index=False)
+                st.success("Journal restored. Refresh the page to see updates.")
             except Exception as e:
-                st.error(f"LLM call failed: {e}")
-
-        result = st.session_state["thesis_cache"].get(cache_key)
-        if isinstance(result, dict):
-            cA, cB = st.columns([1, 1])
-            with cA:
-                st.markdown("### Thesis (why it could run)")
-                for b in result.get("thesis_bullets", []):
-                    st.write(f"• {b}")
-                st.markdown("### Key risks")
-                for b in result.get("key_risks", []):
-                    st.write(f"• {b}")
-            with cB:
-                st.markdown("### Invalidation triggers (explicit)")
-                for b in result.get("invalidation_triggers", []):
-                    st.write(f"• {b}")
-                st.markdown("### Monitoring questions")
-                for b in result.get("monitoring_questions", []):
-                    st.write(f"• {b}")
-
-st.divider()
-st.subheader("⬇️ Export")
-report = rec.copy()
-report["generated_at"] = dt.datetime.now().isoformat(timespec="seconds")
-csv = report.reset_index().to_csv(index=False).encode("utf-8")
-st.download_button("Download recommendations CSV", data=csv, file_name="speculation_agent_recommendations.csv", mime="text/csv")
-st.caption("Next upgrades: earnings/news catalysts, watchlists, backtesting, and automated alerts.")
+                st.error(f"Upload failed: {e}")

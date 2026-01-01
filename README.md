@@ -1,8 +1,20 @@
-# Stock Agent
+# Speculation Stock Agent (Decision Logging + Performance Tracking)
 
-This Streamlit app:
-- Scans a list of tickers
-- Computes momentum / volatility / volume-spike / RSI signals
-- Ranks by a transparent **Speculation Score**
-- Suggests a monthly allocation (e.g., $100/month)
-- Optionally generates **Thesis + Invalidation rules** using the OpenAI API (LLM-assisted)
+Adds:
+- Decision logging to `decision_journal.csv`
+- Performance tracking per decision vs benchmark (QQQ)
+- Download/Upload journal controls (useful for Streamlit Cloud where disk can be ephemeral)
+
+## Run
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+## OpenAI key (for thesis)
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+Restart Streamlit after setting the key.
