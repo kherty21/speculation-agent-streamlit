@@ -1,20 +1,10 @@
-# Speculation Stock Agent
+# Speculation Stock Agent (Earnings + News Catalyst Panel)
 
-Adds:
-- Decision logging to `decision_journal.csv`
-- Performance tracking per decision vs benchmark (QQQ)
-- Download/Upload journal controls (useful for Streamlit Cloud where disk can be ephemeral)
+Adds a per-ticker catalyst panel:
+- Next earnings date (best-effort from yfinance)
+- Recent news list (best-effort from yfinance)
+- Simple "Catalyst Score" heuristic (earnings proximity + news recency)
 
-## Run
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m streamlit run app.py
-```
-
-## OpenAI key (for thesis)
-```bash
-export OPENAI_API_KEY="sk-..."
-```
-Restart Streamlit after setting the key.
+Also includes:
+- Decision logging + performance tracking
+- Optional LLM-assisted thesis + invalidation rules

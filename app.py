@@ -3,7 +3,7 @@ import math
 import json
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -118,6 +118,106 @@ def fetch_close_on_or_after(ticker: str, date_iso: str) -> float:
     except Exception:
         return float("nan")
 
+# -----------------------------
+# Catalysts: earnings + news
+# -----------------------------
+@st.cache_data(ttl=6*60*60, show_spinner=False)
+def fetch_next_earnings_date(ticker: str) -> Optional[str]:
+    """Best-effort next earnings date from yfinance. Returns ISO date string or None."""
+    try:
+        tk = yf.Ticker(ticker)
+
+        # Try get_earnings_dates if available
+        try:
+            ed = tk.get_earnings_dates(limit=8)
+            if isinstance(ed, pd.DataFrame) and not ed.empty:
+                dates = [d.date() for d in ed.index.to_pydatetime()]
+                today = dt.date.today()
+                future = [d for d in dates if d >= today]
+                if future:
+                    return min(future).isoformat()
+        except Exception:
+            pass
+
+        # Fallback: calendar table
+        cal = getattr(tk, "calendar", None)
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            if "Earnings Date" in cal.index:
+                vals = cal.loc["Earnings Date"].dropna().tolist()
+                if vals:
+                    return pd.to_datetime(vals[0]).date().isoformat()
+        return None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=30*60, show_spinner=False)
+def fetch_news(ticker: str, limit: int = 10) -> List[dict]:
+    """News items via yfinance Ticker.news."""
+    items: List[dict] = []
+    try:
+        tk = yf.Ticker(ticker)
+        raw = getattr(tk, "news", None)
+        if not raw:
+            return []
+        now = dt.datetime.now(dt.timezone.utc)
+        for n in raw[:limit]:
+            title = n.get("title") or ""
+            publisher = n.get("publisher") or n.get("source") or ""
+            link = n.get("link") or n.get("url") or ""
+            ts = n.get("providerPublishTime")
+            published = None
+            if ts:
+                try:
+                    published = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc)
+                except Exception:
+                    published = None
+            age_hours = (now - published).total_seconds() / 3600.0 if published else np.nan
+            items.append({
+                "title": title,
+                "publisher": publisher,
+                "url": link,
+                "published_at": published.isoformat().replace("+00:00", "Z") if published else "",
+                "age_hours": age_hours,
+            })
+        return items
+    except Exception:
+        return []
+
+def days_until(date_iso: Optional[str]) -> Optional[int]:
+    if not date_iso:
+        return None
+    try:
+        d = dt.date.fromisoformat(date_iso)
+        return (d - dt.date.today()).days
+    except Exception:
+        return None
+
+def catalyst_score(next_earnings_iso: Optional[str], news_items: List[dict]) -> float:
+    """
+    Simple heuristic catalyst score (0-100):
+    - Earnings within 0-21 days contributes up to 60 points
+    - Recent news (last 72h) contributes up to 40 points
+    """
+    score = 0.0
+    dte = days_until(next_earnings_iso)
+    if dte is not None:
+        if dte <= 0:
+            score += 60.0
+        elif dte <= 21:
+            score += 60.0 * (1.0 - (dte / 21.0))
+
+    recent = 0
+    for it in news_items:
+        ah = it.get("age_hours")
+        if ah is not None and not pd.isna(ah) and ah <= 72:
+            recent += 1
+    score += min(40.0, recent * 10.0)
+
+    return float(min(100.0, max(0.0, score)))
+
+# -----------------------------
+# Scoring
+# -----------------------------
 def score_ticker(df: pd.DataFrame, cfg: ScoreConfig) -> Dict[str, float]:
     close = to_series(df["Close"]).dropna()
     vol = to_series(df["Volume"]).dropna()
@@ -223,13 +323,12 @@ def summarize_metrics_for_llm(ticker: str, row: pd.Series) -> str:
 def llm_thesis_and_invalidation(ticker: str, metrics_text: str, model: str, temperature: float = 0.3) -> dict:
     if not _OPENAI_AVAILABLE:
         raise RuntimeError("OpenAI SDK not installed. Add `openai` to requirements and install it.")
-
     client = OpenAI()
     prompt = f"""
 You are an investing assistant helping a user build a speculative ($100/month) high-risk growth watchlist.
 Generate a concise, decision-useful thesis and explicit invalidation rules for the ticker.
 
-Use ONLY the provided metrics as quantitative evidence. You may reference common qualitative drivers (product, competition, dilution, regulation) but do not invent specific factual claims (e.g., exact revenue, customers, partnerships).
+Use ONLY the provided metrics as quantitative evidence. You may reference common qualitative drivers (product, competition, dilution, regulation) but do not invent specific factual claims.
 If you are uncertain about a claim, phrase it as a hypothesis.
 
 Return STRICT JSON with keys:
@@ -242,12 +341,7 @@ Metrics:
 {metrics_text}
 """.strip()
 
-    resp = client.responses.create(
-        model=model,
-        input=prompt,
-        temperature=temperature,
-    )
-
+    resp = client.responses.create(model=model, input=prompt, temperature=temperature)
     text = getattr(resp, "output_text", None)
     if not text and hasattr(resp, "output"):
         try:
@@ -265,7 +359,9 @@ Metrics:
             return json.loads(m.group(0))
         raise
 
-# --- Journal ---
+# -----------------------------
+# Journal
+# -----------------------------
 def journal_path() -> str:
     return os.path.join(os.getcwd(), JOURNAL_FILE)
 
@@ -289,7 +385,6 @@ def compute_performance(journal: pd.DataFrame) -> pd.DataFrame:
     if journal.empty:
         return journal
     j = journal.copy()
-
     for c in ["date", "ticker", "buy_price", "allocation_$", "spec_score"]:
         if c not in j.columns:
             j[c] = np.nan
@@ -327,6 +422,11 @@ period = st.sidebar.selectbox("History period", ["6mo", "1y", "2y"], index=1)
 refresh = st.sidebar.button("🔄 Refresh data")
 
 st.sidebar.divider()
+st.sidebar.subheader("🗞️ Catalysts")
+news_limit = st.sidebar.slider("News items per ticker", 3, 20, 10)
+news_recency_hours = st.sidebar.slider("Recency window for 'Recent' badge (hours)", 24, 240, 72, 24)
+
+st.sidebar.divider()
 st.sidebar.subheader("🤖 LLM thesis (optional)")
 llm_enabled = st.sidebar.checkbox("Enable LLM-assisted thesis", value=False)
 llm_model = st.sidebar.text_input("Model name", value="gpt-4o-mini")
@@ -338,7 +438,7 @@ cfg = ScoreConfig(min_price=min_price)
 # Main
 # -----------------------------
 st.title("📈 Speculation Stock Agent")
-st.caption("Recommendations + thesis + decision logging + performance tracking (vs QQQ). Educational use only.")
+st.caption("Recommendations + catalysts + thesis + decision logging + performance tracking (vs QQQ). Educational use only.")
 
 tab1, tab2 = st.tabs(["Recommendations", "Decision Journal"])
 
@@ -346,6 +446,8 @@ if refresh:
     fetch_history.clear()
     fetch_last_close.clear()
     fetch_close_on_or_after.clear()
+    fetch_next_earnings_date.clear()
+    fetch_news.clear()
 
 with st.spinner("Fetching market data..."):
     history = fetch_history(tickers, period=period)
@@ -404,10 +506,49 @@ with tab1:
         st.metric("RSI", f"{row['rsi']:.0f}" if not pd.isna(row["rsi"]) else "n/a")
         st.metric("Max drawdown", f"{row['max_drawdown']*100:.0f}%" if not pd.isna(row["max_drawdown"]) else "n/a")
 
+    st.divider()
+    st.subheader("🗓️ Catalysts: Earnings + News")
+    next_earnings = fetch_next_earnings_date(ticker_sel)
+    dte = days_until(next_earnings)
+    news = fetch_news(ticker_sel, limit=int(news_limit))
+    cat = catalyst_score(next_earnings, news)
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        st.metric("Catalyst Score", f"{cat:.0f}/100")
+    with c2:
+        st.metric("Next earnings (est.)", next_earnings or "n/a")
+    with c3:
+        st.metric("Days to earnings", f"{dte}" if dte is not None else "n/a")
+
+    st.caption("Earnings dates and news are best-effort via public feeds through yfinance; verify before trading.")
+
+    if news:
+        for it in news:
+            title = it.get("title","")
+            pub = it.get("publisher","")
+            url = it.get("url","")
+            age = it.get("age_hours", np.nan)
+            recent_badge = "🟢 Recent" if (age is not None and not pd.isna(age) and age <= news_recency_hours) else ""
+            when = it.get("published_at","")
+
+            with st.container():
+                cols = st.columns([0.82, 0.18])
+                with cols[0]:
+                    st.markdown(f"**{title}**  \n{pub} • {when}")
+                    if url:
+                        st.link_button("Open article", url)
+                with cols[1]:
+                    if recent_badge:
+                        st.write(recent_badge)
+    else:
+        st.info("No news items found for this ticker via yfinance.")
+
     if llm_enabled:
+        st.divider()
         st.subheader("🤖 Thesis + Invalidation Rules")
         if not _OPENAI_AVAILABLE:
-            st.warning("OpenAI SDK not installed. Add `openai` to requirements and reinstall.")
+            st.warning("OpenAI SDK not installed. Add `openai` to requirements.txt and reinstall.")
         else:
             metrics_text = summarize_metrics_for_llm(ticker_sel, row)
             st.code(metrics_text, language="text")
@@ -453,10 +594,14 @@ with tab1:
             alloc = float(r.get("allocation_$", 0) or 0)
             if alloc <= 0:
                 continue
+
             thesis_obj = None
             ck = f"{t}:{llm_model}:{llm_temp:.2f}"
             if ck in st.session_state["thesis_cache"]:
                 thesis_obj = st.session_state["thesis_cache"][ck]
+
+            e = fetch_next_earnings_date(t) or ""
+            n = fetch_news(t, limit=int(news_limit))
 
             rows_to_log.append({
                 "date": decision_date.isoformat(),
@@ -467,6 +612,8 @@ with tab1:
                 "alloc_mode": alloc_mode,
                 "universe_size": len(tickers),
                 "note": note,
+                "next_earnings_est": e,
+                "news_count": len(n),
                 "thesis_json": json.dumps(thesis_obj) if thesis_obj else "",
                 "logged_at": dt.datetime.now().isoformat(timespec="seconds"),
             })
@@ -491,15 +638,22 @@ with tab2:
         with st.spinner("Calculating performance (fetching latest prices)…"):
             perf = compute_performance(journal)
 
-        cols = ["date","ticker","allocation_$","buy_price","current_price","return_%","bench_return_%","alpha_vs_bench_%","spec_score","note"]
+        cols = ["date","ticker","allocation_$","buy_price","current_price","return_%","bench_return_%","alpha_vs_bench_%","spec_score","next_earnings_est","news_count","note"]
+        cols = [c for c in cols if c in perf.columns]
         view = perf[cols].copy()
+
         st.dataframe(
             view.style.format({
-                "allocation_$":"${:.2f}","buy_price":"${:.2f}","current_price":"${:.2f}",
-                "return_%":"{:.2f}%","bench_return_%":"{:.2f}%","alpha_vs_bench_%":"{:.2f}%","spec_score":"{:.1f}",
+                "allocation_$":"${:.2f}",
+                "buy_price":"${:.2f}",
+                "current_price":"${:.2f}",
+                "return_%":"{:.2f}%",
+                "bench_return_%":"{:.2f}%",
+                "alpha_vs_bench_%":"{:.2f}%",
+                "spec_score":"{:.1f}",
             }),
             use_container_width=True,
-            height=330
+            height=350
         )
 
         total_alloc = float(perf["allocation_$"].sum()) if "allocation_$" in perf.columns else 0.0
