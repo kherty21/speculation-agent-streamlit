@@ -3,3 +3,4 @@ yfinance>=0.2.40,<0.3
 pandas>=2.2,<2.3
 numpy>=1.26,<3
 openai>=1.0.0,<2
+requests>=2.31,<3
