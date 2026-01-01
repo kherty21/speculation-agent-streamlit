@@ -219,6 +219,130 @@ def finnhub_company_news(ticker: str, limit: int = 10) -> List[dict]:
     except Exception:
         return []
 
+def _get_finnhub_key() -> Optional[str]:
+    try:
+        k = st.secrets.get("FINNHUB_API_KEY", None)
+    except Exception:
+        k = None
+    return k or os.getenv("FINNHUB_API_KEY")
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def finnhub_earnings_calendar_bulk(from_iso: str, to_iso: str, cache_day: str) -> pd.DataFrame:
+    """
+    One bulk call to Finnhub earnings calendar.
+    cache_day is a dummy parameter (e.g., today's date) to force daily cache refresh.
+    Returns DataFrame with columns: symbol, date, hour (may be blank), etc.
+    """
+    token = _get_finnhub_key()
+    if not token:
+        return pd.DataFrame()
+
+    url = "https://finnhub.io/api/v1/calendar/earnings"
+    params = {"from": from_iso, "to": to_iso, "token": token}
+
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json() or {}
+        items = data.get("earningsCalendar", []) or []
+        if not items:
+            return pd.DataFrame()
+        df = pd.DataFrame(items)
+        # Normalize minimal columns we need
+        if "symbol" not in df.columns or "date" not in df.columns:
+            return pd.DataFrame()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_next_earnings_map(df_calendar: pd.DataFrame) -> Dict[str, str]:
+    """
+    Builds {SYMBOL: next_earnings_iso} from a bulk earnings calendar DataFrame.
+    Picks earliest earnings date >= today per symbol.
+    """
+    if df_calendar is None or df_calendar.empty:
+        return {}
+
+    today = dt.date.today()
+    out: Dict[str, str] = {}
+
+    # ensure date parsing
+    tmp = df_calendar.copy()
+    tmp["date_parsed"] = pd.to_datetime(tmp["date"], errors="coerce").dt.date
+    tmp = tmp.dropna(subset=["date_parsed", "symbol"])
+
+    # keep future dates only
+    tmp = tmp[tmp["date_parsed"] >= today]
+
+    if tmp.empty:
+        return {}
+
+    tmp = tmp.sort_values(["symbol", "date_parsed"])
+    firsts = tmp.groupby("symbol", as_index=False).first()
+
+    for _, row in firsts.iterrows():
+        sym = str(row["symbol"]).upper().strip()
+        d = row["date_parsed"]
+        if isinstance(d, dt.date):
+            out[sym] = d.isoformat()
+
+    return out
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def finnhub_company_news_daily(ticker: str, limit: int, cache_day: str) -> List[dict]:
+    """
+    Company news via Finnhub, cached per ticker per day.
+    cache_day is today's date (forces daily refresh).
+    """
+    token = _get_finnhub_key()
+    if not token:
+        return []
+
+    today = dt.date.today()
+    frm = today - dt.timedelta(days=14)
+
+    url = "https://finnhub.io/api/v1/company-news"
+    params = {"symbol": ticker, "from": frm.isoformat(), "to": today.isoformat(), "token": token}
+
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return []
+        raw = r.json() or []
+        if not isinstance(raw, list) or not raw:
+            return []
+
+        now = dt.datetime.now(dt.timezone.utc)
+        out = []
+
+        for n in raw[:limit]:
+            ts = n.get("datetime")
+            published = None
+            if ts:
+                try:
+                    published = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc)
+                except Exception:
+                    published = None
+
+            age_hours = (now - published).total_seconds() / 3600.0 if published else np.nan
+
+            out.append({
+                "title": n.get("headline", "") or "",
+                "publisher": n.get("source", "") or "",
+                "url": n.get("url", "") or "",
+                "published_at": published.isoformat().replace("+00:00", "Z") if published else "",
+                "age_hours": age_hours,
+            })
+
+        return out
+    except Exception:
+        return []
+
+
 # =========================
 # yfinance fetching
 # =========================
@@ -304,10 +428,9 @@ def fetch_next_earnings_date(ticker: str) -> Optional[str]:
 
 @st.cache_data(ttl=30 * 60, show_spinner=False)
 def fetch_news(ticker: str, limit: int = 10) -> List[dict]:
-    # Finnhub primary
-    items = finnhub_company_news(ticker, limit=limit)
-    if items:
-        return items
+    cache_day = dt.date.today().isoformat()
+    items = finnhub_company_news_daily(ticker, limit=int(limit), cache_day=cache_day)
+    return items
 
     # Optional fallback to yfinance
     items2: List[dict] = []
@@ -711,11 +834,28 @@ if "catalyst_table" not in st.session_state:
 
 def build_topn_catalyst_table() -> pd.DataFrame:
     rows = []
+    today = dt.date.today()
+    to_day = today + dt.timedelta(days=int(scan_days))  # scan window
+    cache_day = today.isoformat()
+
+    # ✅ ONE bulk earnings call
+    cal_df = finnhub_earnings_calendar_bulk(
+        from_iso=today.isoformat(),
+        to_iso=to_day.isoformat(),
+        cache_day=cache_day
+    )
+    earnings_map = build_next_earnings_map(cal_df)  # {SYM: "YYYY-MM-DD"}
+
     for t in list(top.index):
-        e = fetch_next_earnings_date(t)
+        sym = t.upper().strip()
+
+        # ✅ earnings lookup is now O(1), no API call
+        e = earnings_map.get(sym, None)
         dte = days_until(e)
 
-        news = fetch_news(t, limit=int(news_limit))
+        # ✅ news is cached per ticker per day
+        news = fetch_news(sym, limit=int(news_limit))
+
         recent_news = 0
         for it in news:
             ah = it.get("age_hours")
@@ -723,9 +863,10 @@ def build_topn_catalyst_table() -> pd.DataFrame:
                 recent_news += 1
 
         cat = catalyst_score(e, news, news_recency_hours=news_recency_hours)
+
         rows.append({
-            "Ticker": t,
-            "Spec Score": round(float(top.loc[t, "spec_score"]), 1),
+            "Ticker": sym,
+            "Spec Score": round(float(top.loc[sym, "spec_score"]), 1),
             "Next earnings (est.)": e or "",
             "Days to earnings": dte if dte is not None else np.nan,
             f"Recent news (<= {news_recency_hours}h)": int(recent_news),
@@ -733,11 +874,11 @@ def build_topn_catalyst_table() -> pd.DataFrame:
             "Catalyst Score": round(cat, 1),
         })
 
+        # Optional throttle still helps if you have lots of tickers, but now only news calls matter
         if scan_pause > 0:
             time.sleep(float(scan_pause))
 
-    tbl = pd.DataFrame(rows)
-    return tbl
+    return pd.DataFrame(rows)
 
 
 def sort_catalyst_table(tbl: pd.DataFrame) -> pd.DataFrame:
