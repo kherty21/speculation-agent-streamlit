@@ -236,3 +236,32 @@ def filter_universe_us_stocks(
 
     audit_df = pd.DataFrame(rows)
     return valid, audit_df
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def build_dynamic_universe_from_finnhub(
+    cache_day: str,
+    exchanges: tuple = ("NYSE", "NASDAQ", "AMEX"),
+    max_symbols: int = 400,
+    include_types: tuple = ("COMMON STOCK", "EQUITY"),
+) -> List[str]:
+    """
+    Returns a candidate ticker universe from Finnhub's US symbol list.
+    """
+    cache_week = dt.date.today().strftime("%G-W%V")
+    df = finnhub_symbols_us(cache_week=cache_week)
+    if df.empty:
+        return []
+
+    # Finnhub symbol list provides "type" but may not map perfectly
+    df["type"] = df["type"].astype(str).str.upper().str.strip()
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+
+    # Keep only plausible equity/common stock-like entries
+    df = df[df["type"].isin([t.upper() for t in include_types])]
+
+    # Basic cleanup: remove weird symbols (optional)
+    df = df[df["symbol"].str.match(r"^[A-Z\.\-]{1,6}$", na=False)]
+
+    tickers = df["symbol"].dropna().unique().tolist()
+    return tickers[:max_symbols]
+
