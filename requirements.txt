@@ -1,5 +1,5 @@
-streamlit>=1.36
-yfinance>=0.2.40
-pandas>=2.2
-numpy>=1.26
-openai>=1.0.0
+streamlit>=1.36,<2
+yfinance>=0.2.40,<0.3
+pandas>=2.2,<2.3
+numpy>=1.26,<3
+openai>=1.0.0,<2
