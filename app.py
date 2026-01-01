@@ -562,8 +562,8 @@ with tab1:
         tbl = pd.DataFrame(rows)
 
         # Default sort applied after scan based on user selection
-        if sort_by == "Earnings soonest":
-            if "Days to earnings" in tbl.columns:
+    if sort_by == "Earnings soonest":
+    if "Days to earnings" in tbl.columns:
                 tbl = tbl.sort_values(["Days to earnings", "Catalyst Score", "Spec Score"], ascending=[True, False, False], na_position="last")
         elif sort_by == "Catalyst score":
             tbl = tbl.sort_values(["Catalyst Score", "Days to earnings", "Spec Score"], ascending=[False, True, False], na_position="last")
@@ -572,7 +572,7 @@ with tab1:
 
         st.session_state["catalyst_table"] = tbl
 
-    tbl = st.session_state["catalyst_table"]
+        tbl = st.session_state["catalyst_table"]
     if isinstance(tbl, pd.DataFrame) and not tbl.empty:
         view_tbl = tbl.copy()
 
