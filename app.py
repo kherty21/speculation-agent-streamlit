@@ -9,6 +9,11 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
+import time
+...
+for t in list(top.index):
+    ...
+    time.sleep(0.2)  # gentle throttle
 
 # Optional: LLM-assisted thesis generation (OpenAI)
 try:
@@ -155,19 +160,29 @@ def fetch_next_earnings_date(ticker: str) -> Optional[str]:
 
 @st.cache_data(ttl=30*60, show_spinner=False)
 def fetch_news(ticker: str, limit: int = 10) -> List[dict]:
-    """News items via yfinance Ticker.news."""
     items: List[dict] = []
     try:
         tk = yf.Ticker(ticker)
-        raw = getattr(tk, "news", None)
+
+        raw = []
+        # Prefer get_news when available
+        if hasattr(tk, "get_news"):
+            try:
+                raw = tk.get_news(count=limit) or []
+            except Exception:
+                raw = []
+        if not raw:
+            raw = getattr(tk, "news", None) or []
+
         if not raw:
             return []
+
         now = dt.datetime.now(dt.timezone.utc)
         for n in raw[:limit]:
             title = n.get("title") or ""
             publisher = n.get("publisher") or n.get("source") or ""
             link = n.get("link") or n.get("url") or ""
-            ts = n.get("providerPublishTime")
+            ts = n.get("providerPublishTime") or n.get("provider_publish_time")
             published = None
             if ts:
                 try:
@@ -175,6 +190,7 @@ def fetch_news(ticker: str, limit: int = 10) -> List[dict]:
                 except Exception:
                     published = None
             age_hours = (now - published).total_seconds() / 3600.0 if published else np.nan
+
             items.append({
                 "title": title,
                 "publisher": publisher,
@@ -185,6 +201,7 @@ def fetch_news(ticker: str, limit: int = 10) -> List[dict]:
         return items
     except Exception:
         return []
+
 
 def days_until(date_iso: Optional[str]) -> Optional[int]:
     if not date_iso:
@@ -563,11 +580,11 @@ with tab1:
         if only_earnings_window:
             # keep rows with 0 <= dte <= earnings_window_days
             if "Days to earnings" in view_tbl.columns:
-                view_tbl = view_tbl[
-                    view_tbl["Days to earnings"].notna() &
-                    (view_tbl["Days to earnings"] >= 0) &
-                    (view_tbl["Days to earnings"] <= earnings_window_days)
-                ]
+    
+                # Only filter rows that actually HAVE an earnings date
+mask_has = view_tbl["Days to earnings"].notna()
+mask_in = (view_tbl["Days to earnings"] >= 0) & (view_tbl["Days to earnings"] <= earnings_window_days)
+view_tbl = view_tbl[~mask_has | (mask_has & mask_in)]
 
         # Apply sort live even after scan (lets user change dropdown without re-scan)
         if not view_tbl.empty:
