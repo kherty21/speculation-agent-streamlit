@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
+import requests
 
 # Optional: LLM-assisted thesis generation (OpenAI)
 try:
@@ -109,6 +110,114 @@ def days_until(date_iso: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
+def _get_finnhub_key() -> Optional[str]:
+    try:
+        k = st.secrets.get("FINNHUB_API_KEY", None)
+    except Exception:
+        k = None
+    return k or os.getenv("FINNHUB_API_KEY")
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def finnhub_next_earnings_date(ticker: str) -> Optional[str]:
+    """
+    Returns next earnings date (ISO string) using Finnhub earnings calendar.
+    """
+    token = _get_finnhub_key()
+    if not token:
+        return None
+
+    # Query a 6-month window ahead (you can widen this if you want)
+    today = dt.date.today()
+    to_date = today + dt.timedelta(days=180)
+
+    url = "https://finnhub.io/api/v1/calendar/earnings"
+    params = {
+        "from": today.isoformat(),
+        "to": to_date.isoformat(),
+        "symbol": ticker,
+        "token": token,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json() or {}
+        items = data.get("earningsCalendar", []) or []
+        if not items:
+            return None
+
+        # Pick earliest report date >= today
+        dates = []
+        for it in items:
+            d = it.get("date")
+            if d:
+                try:
+                    dd = dt.date.fromisoformat(d)
+                    if dd >= today:
+                        dates.append(dd)
+                except Exception:
+                    pass
+
+        if not dates:
+            return None
+        return min(dates).isoformat()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def finnhub_company_news(ticker: str, limit: int = 10) -> List[dict]:
+    """
+    Returns recent company news items via Finnhub.
+    Normalizes to: title, publisher, url, published_at, age_hours
+    """
+    token = _get_finnhub_key()
+    if not token:
+        return []
+
+    today = dt.date.today()
+    frm = today - dt.timedelta(days=14)  # lookback window
+    url = "https://finnhub.io/api/v1/company-news"
+    params = {
+        "symbol": ticker,
+        "from": frm.isoformat(),
+        "to": today.isoformat(),
+        "token": token,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return []
+        raw = r.json() or []
+        if not isinstance(raw, list) or not raw:
+            return []
+
+        now = dt.datetime.now(dt.timezone.utc)
+        out = []
+        for n in raw[:limit]:
+            ts = n.get("datetime")  # unix seconds
+            published = None
+            if ts:
+                try:
+                    published = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc)
+                except Exception:
+                    published = None
+
+            age_hours = (now - published).total_seconds() / 3600.0 if published else np.nan
+
+            out.append({
+                "title": n.get("headline", "") or "",
+                "publisher": n.get("source", "") or "",
+                "url": n.get("url", "") or "",
+                "published_at": published.isoformat().replace("+00:00", "Z") if published else "",
+                "age_hours": age_hours,
+            })
+        return out
+    except Exception:
+        return []
 
 # =========================
 # yfinance fetching
@@ -160,52 +269,50 @@ def fetch_close_on_or_after(ticker: str, date_iso: str) -> float:
     except Exception:
         return float("nan")
 
-
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_next_earnings_date(ticker: str) -> Optional[str]:
-    """
-    Best-effort next earnings date from yfinance.
-    Returns ISO date string or None.
-    """
+    # Finnhub primary
+    d = finnhub_next_earnings_date(ticker)
+    if d:
+        return d
+
+    # Optional fallback to yfinance (keeps behavior if Finnhub misses)
     try:
         tk = yf.Ticker(ticker)
-
-        # Preferred: get_earnings_dates if available
         try:
             ed = tk.get_earnings_dates(limit=8)
             if isinstance(ed, pd.DataFrame) and not ed.empty:
-                dates = [d.date() for d in ed.index.to_pydatetime()]
+                dates = [x.date() for x in ed.index.to_pydatetime()]
                 today = dt.date.today()
-                future = [d for d in dates if d >= today]
+                future = [x for x in dates if x >= today]
                 if future:
                     return min(future).isoformat()
         except Exception:
             pass
 
-        # Fallback: calendar
         cal = getattr(tk, "calendar", None)
         if isinstance(cal, pd.DataFrame) and not cal.empty:
             if "Earnings Date" in cal.index:
                 vals = cal.loc["Earnings Date"].dropna().tolist()
                 if vals:
                     return pd.to_datetime(vals[0]).date().isoformat()
-
-        return None
     except Exception:
-        return None
+        pass
+
+    return None
 
 
 @st.cache_data(ttl=30 * 60, show_spinner=False)
 def fetch_news(ticker: str, limit: int = 10) -> List[dict]:
-    """
-    Returns list of news items from yfinance, best-effort.
-    Prefers tk.get_news() when available; falls back to tk.news.
-    Normalizes: title, publisher, url, published_at, age_hours
-    """
-    items: List[dict] = []
+    # Finnhub primary
+    items = finnhub_company_news(ticker, limit=limit)
+    if items:
+        return items
+
+    # Optional fallback to yfinance
+    items2: List[dict] = []
     try:
         tk = yf.Ticker(ticker)
-
         raw = []
         if hasattr(tk, "get_news"):
             try:
@@ -233,18 +340,16 @@ def fetch_news(ticker: str, limit: int = 10) -> List[dict]:
                     published = None
 
             age_hours = (now - published).total_seconds() / 3600.0 if published else np.nan
-            items.append({
+            items2.append({
                 "title": title,
                 "publisher": publisher,
                 "url": link,
                 "published_at": published.isoformat().replace("+00:00", "Z") if published else "",
                 "age_hours": age_hours,
             })
-
-        return items
+        return items2
     except Exception:
         return []
-
 
 def catalyst_score(next_earnings_iso: Optional[str], news_items: List[dict], news_recency_hours: int = 72) -> float:
     """
